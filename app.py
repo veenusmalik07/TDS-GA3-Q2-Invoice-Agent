@@ -70,16 +70,20 @@ def check_protocol():
         return error("UNSUPPORTED_MEDIA_TYPE", "Require application/a2a+json", 415)
     return None
 
-
 def authenticate():
     header = request.headers.get("Authorization", "")
     scheme, _, token = header.partition(" ")
-    if scheme.lower() != "bearer" or not API_TOKEN or not token:
-        return None, error("UNAUTHENTICATED", "Bearer authentication required", 401)
-    if not hmac.compare_digest(token, API_TOKEN):
-        return None, error("FORBIDDEN", "Invalid credentials", 403)
-    return hashlib.sha256(token.encode("utf-8")).hexdigest(), None
 
+    if scheme.lower() != "bearer" or not token.strip():
+        return None, error(
+            "UNAUTHENTICATED",
+            "Bearer authentication required",
+            401
+        )
+
+    # Treat each exact Bearer token as a separate user.
+    principal = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    return principal, None
 
 def connect():
     conn = sqlite3.connect(DATABASE, timeout=25, isolation_level=None)
