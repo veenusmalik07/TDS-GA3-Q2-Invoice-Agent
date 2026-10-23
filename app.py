@@ -1,27 +1,32 @@
-
+```python
 import os
 import json
 import uuid
 import hashlib
+import hmac
 import sqlite3
 import threading
 from datetime import datetime, timezone
+
 from flask import Flask, jsonify, request, make_response
 
 app = Flask(__name__)
 
 AGENT_NAME = "GA3 Invoice Agent"
 AGENT_VERSION = "1.0.0"
+
 PUBLIC_URL = os.environ.get(
     "PUBLIC_URL",
     "https://tds-ga3-q2-invoice-agent.onrender.com"
 ).rstrip("/")
+
 API_TOKEN = os.environ.get("API_TOKEN", "")
 DATABASE = os.environ.get("DATABASE_PATH", "agent_tasks.db")
 
 INPUT_MODE = "application/vnd.ga5.invoice-claim-batch+json"
 PROPOSAL_MODE = "application/vnd.ga5.invoice-action-proposals+json"
 RECEIPT_MODE = "application/vnd.ga5.invoice-action-receipts+json"
+RESULT_MODE = "application/vnd.ga5.invoice-action-results+json"
 A2A_JSON = "application/a2a+json"
 
 ACTIONS = {
@@ -32,7 +37,6 @@ ACTIONS = {
     "open_exception",
 }
 
-# Serializes state-changing operations within this process.
 DB_LOCK = threading.RLock()
 
 
@@ -49,6 +53,7 @@ def connect_db():
 def init_db():
     with DB_LOCK:
         conn = connect_db()
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS tasks (
                 task_id TEXT PRIMARY KEY,
@@ -61,6 +66,7 @@ def init_db():
                 updated_at TEXT NOT NULL
             )
         """)
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 owner TEXT NOT NULL,
@@ -70,6 +76,7 @@ def init_db():
                 PRIMARY KEY (owner, message_id)
             )
         """)
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS decisions (
                 task_id TEXT NOT NULL,
@@ -79,6 +86,7 @@ def init_db():
                 PRIMARY KEY (task_id, package_id)
             )
         """)
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS receipts (
                 task_id TEXT NOT NULL,
@@ -89,6 +97,7 @@ def init_db():
                 PRIMARY KEY (task_id, package_id)
             )
         """)
+
         conn.commit()
         conn.close()
 
@@ -102,7 +111,10 @@ def now():
 
 def canonical_hash(value):
     raw = json.dumps(
-        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False
     )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -123,49 +135,95 @@ def error(message, status=400, code="INVALID_REQUEST"):
     }, status)
 
 
+# ---------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------
+
 def extract_bearer():
     header = request.headers.get("Authorization", "")
     scheme, _, token = header.partition(" ")
+
     if scheme.lower() != "bearer" or not token:
         return None
+
     return token
 
 
 def get_owner():
     token = extract_bearer()
+
     if not API_TOKEN or not token:
         return None
-    # Never store or expose the raw token.
+
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def require_owner():
-    owner = get_owner()
-    if owner is None:
-        return None, error("Bearer authentication required.", 401, "UNAUTHENTICATED")
-    if not API_TOKEN or not hashlib.compare_digest(
-        owner, hashlib.sha256(API_TOKEN.encode("utf-8")).hexdigest()
-    ):
-        return None, error("Invalid credentials.", 403, "FORBIDDEN")
-    return owner, None
+    token = extract_bearer()
 
+    if not API_TOKEN:
+        return None, error(
+            "Server API_TOKEN is not configured.",
+            500,
+            "SERVER_CONFIGURATION_ERROR"
+        )
+
+    if not token:
+        return None, error(
+            "Bearer authentication required.",
+            401,
+            "UNAUTHENTICATED"
+        )
+
+    expected = hashlib.sha256(API_TOKEN.encode("utf-8")).hexdigest()
+    supplied = hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    if not hmac.compare_digest(supplied, expected):
+        return None, error(
+            "Invalid credentials.",
+            403,
+            "FORBIDDEN"
+        )
+
+    return supplied, None
+
+
+# ---------------------------------------------------------
+# A2A protocol helpers
+# ---------------------------------------------------------
 
 def check_protocol_headers():
     version = request.headers.get("A2A-Version")
-    if version != "1.0":
-        return error("A2A-Version: 1.0 is required.", 400, "VERSION_MISMATCH")
 
-    content_type = request.headers.get("Content-Type", "").split(";")[0].strip()
+    if version != "1.0":
+        return error(
+            "A2A-Version: 1.0 is required.",
+            400,
+            "VERSION_MISMATCH"
+        )
+
+    content_type = (
+        request.headers.get("Content-Type", "")
+        .split(";")[0]
+        .strip()
+    )
+
     if content_type not in ("application/json", A2A_JSON):
-        return error("Use application/a2a+json or application/json.", 415, "UNSUPPORTED_MEDIA_TYPE")
+        return error(
+            "Use application/a2a+json or application/json.",
+            415,
+            "UNSUPPORTED_MEDIA_TYPE"
+        )
 
     return None
 
 
 def get_message_parts(message):
     parts = message.get("parts")
+
     if not isinstance(parts, list):
         return []
+
     return parts
 
 
@@ -174,15 +232,31 @@ def find_artifact_data(task, media_type):
         for part in artifact.get("parts", []):
             if part.get("mediaType") == media_type:
                 return part.get("data")
+
     return None
 
 
-def save_task(conn, task_id, context_id, owner, status, batch_id, task):
+def save_task(
+    conn,
+    task_id,
+    context_id,
+    owner,
+    status,
+    batch_id,
+    task
+):
     timestamp = now()
+
     conn.execute("""
         INSERT INTO tasks (
-            task_id, context_id, owner, status, batch_id,
-            task_json, created_at, updated_at
+            task_id,
+            context_id,
+            owner,
+            status,
+            batch_id,
+            task_json,
+            created_at,
+            updated_at
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(task_id) DO UPDATE SET
@@ -190,9 +264,14 @@ def save_task(conn, task_id, context_id, owner, status, batch_id, task):
             task_json=excluded.task_json,
             updated_at=excluded.updated_at
     """, (
-        task_id, context_id, owner, status, batch_id,
+        task_id,
+        context_id,
+        owner,
+        status,
+        batch_id,
         json.dumps(task, separators=(",", ":")),
-        timestamp, timestamp
+        timestamp,
+        timestamp
     ))
 
 
@@ -201,8 +280,10 @@ def load_task(conn, task_id, owner):
         "SELECT * FROM tasks WHERE task_id=? AND owner=?",
         (task_id, owner)
     ).fetchone()
+
     if row is None:
         return None
+
     return row, json.loads(row["task_json"])
 
 
@@ -211,58 +292,68 @@ def task_envelope(task):
 
 
 # ---------------------------------------------------------
-# A2A Agent Card
+# Agent card and health check
 # ---------------------------------------------------------
 
 @app.get("/")
 def health():
-    return jsonify({"status": "ok", "service": AGENT_NAME})
+    return jsonify({
+        "status": "ok",
+        "service": AGENT_NAME
+    })
 
 
 @app.get("/.well-known/agent-card.json")
 def agent_card():
-    base_url = PUBLIC_URL
     return jsonify({
         "name": AGENT_NAME,
         "description": "Evidence-based invoice processing agent",
         "version": AGENT_VERSION,
-        "url": f"{base_url}/a2a/",
+        "url": f"{PUBLIC_URL}/a2a/",
         "capabilities": {},
         "defaultInputModes": [INPUT_MODE],
-        "defaultOutputModes": [PROPOSAL_MODE, RECEIPT_MODE],
+        "defaultOutputModes": [
+            PROPOSAL_MODE,
+            RECEIPT_MODE
+        ],
         "supportedInterfaces": [{
-            "url": f"{base_url}/a2a/",
+            "url": f"{PUBLIC_URL}/a2a/",
             "protocolBinding": "HTTP+JSON",
             "protocolVersion": "1.0"
         }],
         "skills": [{
             "id": "invoice_action_agent",
             "name": "Invoice Action Agent",
-            "description": "Reviews invoice evidence and proposes safe actions",
-            "tags": ["invoice", "payments", "evidence", "approval"]
+            "description": (
+                "Reviews invoice evidence and proposes safe actions"
+            ),
+            "tags": [
+                "invoice",
+                "payments",
+                "evidence",
+                "approval"
+            ]
         }]
     })
 
 
 # ---------------------------------------------------------
-# Invoice decisions
+# Invoice decision logic
 # ---------------------------------------------------------
 
 def package_documents(package):
-    """
-    Return document/evidence text supplied in the package.
-    This deliberately does not treat unrelated words or archive examples
-    as decisive evidence.
-    """
+    """Collect text values from the supplied invoice package."""
     values = []
 
     def walk(value, key=""):
         if isinstance(value, dict):
             for k, v in value.items():
                 walk(v, str(k))
+
         elif isinstance(value, list):
             for item in value:
                 walk(item, key)
+
         elif isinstance(value, str):
             values.append((key, value))
 
@@ -274,16 +365,19 @@ def decide_package(package, policy_revision=None):
     """
     Conservative evidence-based baseline.
 
-    For full assignment accuracy, this function should be connected to an
-    AI model that reads the complete invoice documents and identifies the
-    exact three decisive bracketed references.
+    This baseline does not replace a full document-understanding
+    model. It uses the information present in the submitted package.
     """
+
     package_id = str(package.get("packageId", "")).strip()
+
     if not package_id:
         package_id = "pkg-" + canonical_hash(package)[:20]
 
     documents = package_documents(package)
-    combined = "\n".join(value for _, value in documents).lower()
+    combined = "\n".join(
+        value for _, value in documents
+    ).lower()
 
     vendor = str(package.get("vendorName", "")).strip()
     invoice_number = str(package.get("invoiceNumber", "")).strip()
@@ -291,87 +385,131 @@ def decide_package(package, policy_revision=None):
     currency = str(package.get("currency", "INR")).strip()
 
     evidence_refs = package.get("evidenceRefs", [])
+
     if not isinstance(evidence_refs, list):
         evidence_refs = []
 
-    # Use explicit source references where available.
-    # Never fabricate bracketed evidence references.
+    # Extract explicit bracketed references from source text.
+    import re
+
     explicit_refs = []
+
     for _, value in documents:
-        import re
-        explicit_refs.extend(re.findall(r"\[([^\[\]]+)\]", value))
+        explicit_refs.extend(
+            re.findall(r"\[([^\[\]]+)\]", value)
+        )
 
     decisive_refs = list(dict.fromkeys(explicit_refs))[:3]
 
+    # Supplement from explicitly supplied evidence references.
     if len(decisive_refs) < 3:
         for ref in evidence_refs:
-            if isinstance(ref, str) and ref not in decisive_refs:
+            if (
+                isinstance(ref, str)
+                and ref not in decisive_refs
+            ):
                 decisive_refs.append(ref)
+
             if len(decisive_refs) == 3:
                 break
 
-    # Default to exception when the package lacks enough usable evidence.
+    # Default to exception unless evidence supports a safer choice.
     action = "open_exception"
-    reasons = ["Insufficient verified evidence to authorize an automatic payment."]
+    reasons = [
+        "Insufficient verified evidence to authorize an automatic payment."
+    ]
 
     duplicate = any(
         phrase in combined
         for phrase in (
-            "already paid", "payment completed", "previously paid",
-            "duplicate invoice", "duplicate payment"
+            "already paid",
+            "payment completed",
+            "previously paid",
+            "duplicate invoice",
+            "duplicate payment"
         )
     )
+
     conflicting = any(
         phrase in combined
         for phrase in (
-            "conflicting amount", "amount mismatch", "vendor mismatch",
-            "invoice number mismatch", "records conflict"
+            "conflicting amount",
+            "amount mismatch",
+            "vendor mismatch",
+            "invoice number mismatch",
+            "records conflict"
         )
     )
+
     verification_pending = any(
         phrase in combined
         for phrase in (
-            "verification pending", "awaiting verification",
-            "not verified", "verification required", "on hold"
+            "verification pending",
+            "awaiting verification",
+            "not verified",
+            "verification required",
+            "on hold"
         )
     )
+
     approval_required = any(
         phrase in combined
         for phrase in (
-            "approval required", "manager approval",
-            "outside delegated authority", "approval limit exceeded"
+            "approval required",
+            "manager approval",
+            "outside delegated authority",
+            "approval limit exceeded"
         )
     )
 
     if duplicate:
         action = "reject_duplicate"
-        reasons = ["Source documents explicitly indicate prior payment or duplication."]
+        reasons = [
+            "Source documents explicitly indicate prior payment or duplication."
+        ]
+
     elif conflicting:
         action = "open_exception"
-        reasons = ["Source records contain a material conflict."]
+        reasons = [
+            "Source records contain a material conflict."
+        ]
+
     elif verification_pending:
         action = "hold_invoice"
-        reasons = ["A stated verification requirement remains unresolved."]
+        reasons = [
+            "A stated verification requirement remains unresolved."
+        ]
+
     elif approval_required:
         action = "request_approval"
-        reasons = ["Source documents indicate that approval is required."]
+        reasons = [
+            "Source documents indicate that approval is required."
+        ]
+
     elif (
-        vendor and invoice_number
-        and isinstance(amount_minor, int) and amount_minor > 0
+        vendor
+        and invoice_number
+        and isinstance(amount_minor, int)
+        and amount_minor > 0
         and len(decisive_refs) >= 2
     ):
-        # Do not automatically settle merely because basic fields exist.
         action = "request_approval"
         reasons = [
-            "Basic invoice fields and evidence references exist, but delegated "
-            "authority and reconciliation have not been independently verified."
+            "Basic invoice fields and evidence references exist, but "
+            "delegated authority and reconciliation have not been "
+            "independently verified."
         ]
 
     action_id = str(uuid.uuid4())
+
     facts = {
         "vendorName": vendor,
         "invoiceNumber": invoice_number,
-        "amountMinor": amount_minor if isinstance(amount_minor, int) else 0,
+        "amountMinor": (
+            amount_minor
+            if isinstance(amount_minor, int)
+            else 0
+        ),
         "currency": currency or "INR"
     }
 
@@ -381,11 +519,11 @@ def decide_package(package, policy_revision=None):
         + (
             " Supporting evidence references: "
             + ", ".join(decisive_refs)
-            if decisive_refs else
-            " No decisive source references were verified."
+            if decisive_refs
+            else " No decisive source references were verified."
         )
-    )
-    rationale = rationale[:1500]
+    )[:1500]
+
     if len(rationale) < 60:
         rationale = rationale.ljust(60, ".")
 
@@ -402,19 +540,35 @@ def decide_package(package, policy_revision=None):
 def validate_batch(data):
     if not isinstance(data, dict):
         return None, "Batch data must be a JSON object."
-    if not isinstance(data.get("batchId"), str) or not data["batchId"]:
+
+    if (
+        not isinstance(data.get("batchId"), str)
+        or not data["batchId"]
+    ):
         return None, "batchId is required."
-    if not isinstance(data.get("policyRevision"), str) or not data["policyRevision"]:
+
+    if (
+        not isinstance(data.get("policyRevision"), str)
+        or not data["policyRevision"]
+    ):
         return None, "policyRevision is required."
+
     packages = data.get("packages")
+
     if not isinstance(packages, list) or not packages:
         return None, "packages must be a non-empty list."
+
     if any(not isinstance(p, dict) for p in packages):
         return None, "Every package must be an object."
 
     ids = [str(p.get("packageId", "")) for p in packages]
-    if any(not value for value in ids) or len(ids) != len(set(ids)):
+
+    if any(not value for value in ids):
         return None, "Package IDs must be present and unique."
+
+    if len(ids) != len(set(ids)):
+        return None, "Package IDs must be present and unique."
+
     return packages, None
 
 
@@ -425,27 +579,38 @@ def validate_batch(data):
 @app.post("/a2a/message:send")
 def message_send():
     header_error = check_protocol_headers()
+
     if header_error:
         return header_error
 
     owner, auth_error = require_owner()
+
     if auth_error:
         return auth_error
 
     body = request.get_json(silent=True)
-    if not isinstance(body, dict) or not isinstance(body.get("message"), dict):
-        return error("Expected an A2A request containing message.", 400)
+
+    if (
+        not isinstance(body, dict)
+        or not isinstance(body.get("message"), dict)
+    ):
+        return error(
+            "Expected an A2A request containing message."
+        )
 
     message = body["message"]
     message_id = message.get("messageId")
     role = message.get("role")
+
     if not isinstance(message_id, str) or not message_id:
         return error("message.messageId is required.")
+
     if role != "ROLE_USER":
         return error("message.role must be ROLE_USER.")
 
     semantic_hash = canonical_hash(message)
     parts = get_message_parts(message)
+
     if not parts:
         return error("message.parts must not be empty.")
 
@@ -453,7 +618,11 @@ def message_send():
         conn = connect_db()
 
         existing = conn.execute(
-            "SELECT semantic_hash, task_id FROM messages WHERE owner=? AND message_id=?",
+            """
+            SELECT semantic_hash, task_id
+            FROM messages
+            WHERE owner=? AND message_id=?
+            """,
             (owner, message_id)
         ).fetchone()
 
@@ -465,46 +634,69 @@ def message_send():
                     409,
                     "IDEMPOTENCY_CONFLICT"
                 )
-            loaded = load_task(conn, existing["task_id"], owner)
+
+            loaded = load_task(
+                conn,
+                existing["task_id"],
+                owner
+            )
             conn.close()
+
             if loaded:
                 return json_response(task_envelope(loaded[1]))
+
             return error("Stored task is unavailable.", 500)
 
         batch_part = next(
-            (p for p in parts if p.get("mediaType") == INPUT_MODE),
-            None
-        )
-        results_part = next(
-            (p for p in parts if p.get("mediaType") ==
-             "application/vnd.ga5.invoice-action-results+json"),
+            (
+                p for p in parts
+                if p.get("mediaType") == INPUT_MODE
+            ),
             None
         )
 
-        # New initial invoice batch.
+        results_part = next(
+            (
+                p for p in parts
+                if p.get("mediaType") == RESULT_MODE
+            ),
+            None
+        )
+
+        # Initial invoice batch.
         if batch_part is not None:
             data = batch_part.get("data")
+
             packages, validation_error = validate_batch(data)
+
             if validation_error:
                 conn.close()
                 return error(validation_error)
 
             task_id = str(uuid.uuid4())
             context_id = str(uuid.uuid4())
+
             proposals = []
             seen_actions = set()
 
             for package in packages:
-                proposal = decide_package(package, data.get("policyRevision"))
+                proposal = decide_package(
+                    package,
+                    data.get("policyRevision")
+                )
+
                 if proposal["actionId"] in seen_actions:
                     proposal["actionId"] = str(uuid.uuid4())
+
                 seen_actions.add(proposal["actionId"])
                 proposals.append(proposal)
 
             task = {
                 "id": task_id,
                 "contextId": context_id,
-                "status": {"state": "TASK_STATE_INPUT_REQUIRED"},
+                "status": {
+                    "state": "TASK_STATE_INPUT_REQUIRED"
+                },
                 "history": [message],
                 "artifacts": [{
                     "artifactId": str(uuid.uuid4()),
@@ -519,25 +711,45 @@ def message_send():
             }
 
             save_task(
-                conn, task_id, context_id, owner,
-                "TASK_STATE_INPUT_REQUIRED", data["batchId"], task
+                conn,
+                task_id,
+                context_id,
+                owner,
+                "TASK_STATE_INPUT_REQUIRED",
+                data["batchId"],
+                task
             )
+
             conn.execute(
                 "INSERT INTO messages VALUES (?, ?, ?, ?)",
-                (owner, message_id, semantic_hash, task_id)
+                (
+                    owner,
+                    message_id,
+                    semantic_hash,
+                    task_id
+                )
             )
 
             for proposal in proposals:
                 conn.execute(
-                    "INSERT INTO decisions VALUES (?, ?, ?, ?)",
+                    """
+                    INSERT INTO decisions
+                    VALUES (?, ?, ?, ?)
+                    """,
                     (
-                        task_id, proposal["packageId"], proposal["actionId"],
-                        json.dumps(proposal, separators=(",", ":"))
+                        task_id,
+                        proposal["packageId"],
+                        proposal["actionId"],
+                        json.dumps(
+                            proposal,
+                            separators=(",", ":")
+                        )
                     )
                 )
 
             conn.commit()
             conn.close()
+
             return json_response(task_envelope(task))
 
         # Continuation containing the grader's results.
@@ -546,60 +758,106 @@ def message_send():
             context_id = message.get("contextId")
             data = results_part.get("data")
 
-            if not isinstance(task_id, str) or not isinstance(context_id, str):
+            if (
+                not isinstance(task_id, str)
+                or not isinstance(context_id, str)
+            ):
                 conn.close()
-                return error("Result continuation needs taskId and contextId.")
+                return error(
+                    "Result continuation needs taskId and contextId."
+                )
 
             loaded = load_task(conn, task_id, owner)
+
             if not loaded:
                 conn.close()
-                return error("Task not found.", 404, "TASK_NOT_FOUND")
+                return error(
+                    "Task not found.",
+                    404,
+                    "TASK_NOT_FOUND"
+                )
 
             row, task = loaded
+
             if row["context_id"] != context_id:
                 conn.close()
-                return error("Task context does not match.", 409, "CONTEXT_MISMATCH")
+                return error(
+                    "Task context does not match.",
+                    409,
+                    "CONTEXT_MISMATCH"
+                )
+
             if row["status"] != "TASK_STATE_INPUT_REQUIRED":
                 conn.close()
-                return error("Task is not awaiting results.", 409, "INVALID_TASK_STATE")
-            if not isinstance(data, dict) or data.get("batchId") != row["batch_id"]:
+                return error(
+                    "Task is not awaiting results.",
+                    409,
+                    "INVALID_TASK_STATE"
+                )
+
+            if (
+                not isinstance(data, dict)
+                or data.get("batchId") != row["batch_id"]
+            ):
                 conn.close()
-                return error("Result batch does not match the task.", 409, "BATCH_MISMATCH")
+                return error(
+                    "Result batch does not match the task.",
+                    409,
+                    "BATCH_MISMATCH"
+                )
 
             results = data.get("results")
+
             if not isinstance(results, list):
                 conn.close()
                 return error("results must be a list.")
 
-            proposals = find_artifact_data(task, PROPOSAL_MODE)
-            if not isinstance(proposals, dict):
+            proposal_data = find_artifact_data(
+                task,
+                PROPOSAL_MODE
+            )
+
+            if not isinstance(proposal_data, dict):
                 conn.close()
-                return error("Stored proposal artifact is missing.", 500)
+                return error(
+                    "Stored proposal artifact is missing.",
+                    500
+                )
 
             proposal_by_key = {
-                (p["packageId"], p["actionId"], p["action"]): p
-                for p in proposals.get("proposals", [])
+                (
+                    p["packageId"],
+                    p["actionId"],
+                    p["action"]
+                ): p
+                for p in proposal_data.get("proposals", [])
             }
+
             accepted = []
             seen = set()
 
             for result in results:
                 if not isinstance(result, dict):
                     continue
+
                 key = (
                     result.get("packageId"),
                     result.get("actionId"),
                     result.get("action")
                 )
+
                 proposal = proposal_by_key.get(key)
+
                 if not proposal or key in seen:
                     continue
+
                 seen.add(key)
 
                 if result.get("outcome") != "ACCEPTED":
                     continue
 
                 nonce = result.get("receiptNonce")
+
                 if not isinstance(nonce, str) or not nonce:
                     continue
 
@@ -611,18 +869,31 @@ def message_send():
                     "facts": proposal["facts"],
                     "evidenceRefs": proposal["evidenceRefs"]
                 }
+
                 accepted.append(accepted_item)
 
                 conn.execute(
-                    "INSERT OR IGNORE INTO receipts VALUES (?, ?, ?, ?, ?)",
+                    """
+                    INSERT OR IGNORE INTO receipts
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
                     (
-                        task_id, proposal["packageId"], proposal["actionId"],
-                        nonce, json.dumps(accepted_item, separators=(",", ":"))
+                        task_id,
+                        proposal["packageId"],
+                        proposal["actionId"],
+                        nonce,
+                        json.dumps(
+                            accepted_item,
+                            separators=(",", ":")
+                        )
                     )
                 )
 
             task["history"].append(message)
-            task["status"] = {"state": "TASK_STATE_COMPLETED"}
+            task["status"] = {
+                "state": "TASK_STATE_COMPLETED"
+            }
+
             task["artifacts"].append({
                 "artifactId": str(uuid.uuid4()),
                 "parts": [{
@@ -635,19 +906,35 @@ def message_send():
             })
 
             save_task(
-                conn, task_id, context_id, owner,
-                "TASK_STATE_COMPLETED", row["batch_id"], task
+                conn,
+                task_id,
+                context_id,
+                owner,
+                "TASK_STATE_COMPLETED",
+                row["batch_id"],
+                task
             )
+
             conn.execute(
                 "INSERT INTO messages VALUES (?, ?, ?, ?)",
-                (owner, message_id, semantic_hash, task_id)
+                (
+                    owner,
+                    message_id,
+                    semantic_hash,
+                    task_id
+                )
             )
+
             conn.commit()
             conn.close()
+
             return json_response(task_envelope(task))
 
         conn.close()
-        return error("Message must contain an invoice batch or result continuation.")
+
+        return error(
+            "Message must contain an invoice batch or result continuation."
+        )
 
 
 # ---------------------------------------------------------
@@ -657,10 +944,12 @@ def message_send():
 @app.get("/a2a/tasks/<task_id>")
 def get_task(task_id):
     header_error = check_protocol_headers()
+
     if header_error:
         return header_error
 
     owner, auth_error = require_owner()
+
     if auth_error:
         return auth_error
 
@@ -670,30 +959,47 @@ def get_task(task_id):
         conn.close()
 
     if not loaded:
-        return error("Task not found.", 404, "TASK_NOT_FOUND")
+        return error(
+            "Task not found.",
+            404,
+            "TASK_NOT_FOUND"
+        )
+
     return json_response(task_envelope(loaded[1]))
 
 
 @app.get("/a2a/tasks")
 def list_tasks():
     header_error = check_protocol_headers()
+
     if header_error:
         return header_error
 
     owner, auth_error = require_owner()
+
     if auth_error:
         return auth_error
 
     with DB_LOCK:
         conn = connect_db()
+
         rows = conn.execute(
-            "SELECT task_json FROM tasks WHERE owner=? ORDER BY created_at DESC",
+            """
+            SELECT task_json
+            FROM tasks
+            WHERE owner=?
+            ORDER BY created_at DESC
+            """,
             (owner,)
         ).fetchall()
+
         conn.close()
 
     return json_response({
-        "tasks": [json.loads(row["task_json"]) for row in rows]
+        "tasks": [
+            json.loads(row["task_json"])
+            for row in rows
+        ]
     })
 
 
@@ -704,10 +1010,12 @@ def list_tasks():
 @app.post("/a2a/tasks/<task_id>:cancel")
 def cancel_task(task_id):
     header_error = check_protocol_headers()
+
     if header_error:
         return header_error
 
     owner, auth_error = require_owner()
+
     if auth_error:
         return auth_error
 
@@ -717,18 +1025,39 @@ def cancel_task(task_id):
 
         if not loaded:
             conn.close()
-            return error("Task not found.", 404, "TASK_NOT_FOUND")
+            return error(
+                "Task not found.",
+                404,
+                "TASK_NOT_FOUND"
+            )
 
         row, task = loaded
-        if row["status"] in ("TASK_STATE_COMPLETED", "TASK_STATE_CANCELED"):
-            conn.close()
-            return error("Task is already terminal.", 409, "TASK_TERMINAL")
 
-        task["status"] = {"state": "TASK_STATE_CANCELED"}
+        if row["status"] in (
+            "TASK_STATE_COMPLETED",
+            "TASK_STATE_CANCELED"
+        ):
+            conn.close()
+            return error(
+                "Task is already terminal.",
+                409,
+                "TASK_TERMINAL"
+            )
+
+        task["status"] = {
+            "state": "TASK_STATE_CANCELED"
+        }
+
         save_task(
-            conn, task_id, row["context_id"], owner,
-            "TASK_STATE_CANCELED", row["batch_id"], task
+            conn,
+            task_id,
+            row["context_id"],
+            owner,
+            "TASK_STATE_CANCELED",
+            row["batch_id"],
+            task
         )
+
         conn.commit()
         conn.close()
 
@@ -741,21 +1070,38 @@ def cancel_task(task_id):
 
 @app.errorhandler(404)
 def not_found(_):
-    return error("Route not found.", 404, "NOT_FOUND")
+    return error(
+        "Route not found.",
+        404,
+        "NOT_FOUND"
+    )
 
 
 @app.errorhandler(405)
 def method_not_allowed(_):
-    return error("Method not allowed.", 405, "METHOD_NOT_ALLOWED")
+    return error(
+        "Method not allowed.",
+        405,
+        "METHOD_NOT_ALLOWED"
+    )
 
 
 @app.errorhandler(500)
 def internal_error(_):
-    return error("Internal server error.", 500, "INTERNAL_ERROR")
+    return error(
+        "Internal server error.",
+        500,
+        "INTERNAL_ERROR"
+    )
 
+
+# ---------------------------------------------------------
+# Run locally / Render
+# ---------------------------------------------------------
 
 if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 10000))
     )
+```
